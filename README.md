@@ -21,6 +21,17 @@ Extension for VSCode to make writing Lua scripts for  <a href="https://store.ste
 <img src="https://badgen.net/badge/made%20with/%E2%9D%A4/red"/>
 </div>
 
+## Hub 集成（本 fork 的改动）
+
+本仓库是 [`rolandostar/tabletopsimulator-lua-vscode`](https://github.com/rolandostar/tabletopsimulator-lua-vscode) 的 fork，为 **TTS 图包制作维护工具**适配了它的 `tts-hub` 常驻进程：
+
+- 默认经 hub 的 **39997 TCP 扇出**接收 TTS 推送；出站命令仍直发 TTS 本体 39999。
+- hub 不在线时按 `ttslua.hub.fallback` 降级：
+  - `prompt`（默认）：只连 hub，连不上时状态栏提示「请运行 tts-hub」；
+  - `bind`：临时绑 39998 监听 TTS（与 CLI 独立模式同策略）。
+- 连接配置（`ttslua.hub.host` / `port` / `fallback` / `reconnectMaxMs`）与完整说明见 [`../docs/editor.md`](../docs/editor.md) 的「VSCode 插件（深度层）」章节。
+- 原版功能保留：Console++ 集成 / Lua 与 XML 自动补全 / 错误跳转（Go to Error）/ Execute Lua / Get-Send Scripts。
+
 ## Features
 
 - Get/Send Scripts

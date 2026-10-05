@@ -10,6 +10,9 @@
  *   由 JsonStreamDecoder 分帧；
  * - 出站（编辑器→TTS）：sendToTTS 经 transport.send 直发 39999，前置
  *   transport.isConnected() 门槛（T8.3，替代上游的 isServerRunning）；
+ * - 降级双模式（T12.2）：`ttslua.hub.fallback='bind'` 时启动先探测 hub 端口，
+ *   不可达则改用 ServerTransport 临时绑 39998 直连 TTS；'prompt' 恒用
+ *   ClientTransport，不回落，断开时状态栏提示启动 tts-hub；
  * - 连接生命周期由 ConnectionStateMachine 跟踪，状态栏镜像其 'stateChange'；
  * - Go-to-Error 用的 _lastSentScripts：GetScripts 响应（T5.2）与 SaveAndPlay
  *   两条路径都登记，并带内容 hash 持久化到 LocalStorageService（T8.2），
@@ -18,6 +21,7 @@
 import * as vscode from 'vscode';
 import * as fs from 'fs';
 import * as crypto from 'crypto';
+import * as net from 'net';
 
 import path = require('path');
 import bundler from 'luabundle';
@@ -30,10 +34,12 @@ import TTSConsolePanel from '@/TTSConsole';
 import TTSWorkDir from '@/vscode/TTSWorkDir';
 import LocalStorageService from './vscode/LocalStorageService';
 import {getHubConfig} from '@/config';
+import type {HubConfig} from '@/config';
 import {ClientTransport} from '@/transport/ClientTransport';
 import {ConnectionStateMachine} from '@/transport/ConnectionStateMachine';
 import type {ConnectionState} from '@/transport/ConnectionStateMachine';
 import type {ITransport} from '@/transport/ITransport';
+import {ServerTransport} from '@/transport/ServerTransport';
 
 type InGameObjectsList = {[key: string]: {name?: string; type?: string; iname?: string}};
 
@@ -44,13 +50,46 @@ interface PersistedScriptEntry {
   hash: string;
 }
 
-/** 连接状态 → 状态栏文案（T1.3）。 */
+/** 连接状态 → 状态栏文案（T1.3；disconnected 文案按 T12.2 prompt 模式要求）。 */
 const HUB_STATUS_TEXT: {[key in ConnectionState]: string} = {
   connected: '$(check) Connected to hub',
   connecting: '$(sync~spin) Connecting...',
   reconnecting: '$(sync~spin) Connecting...',
-  disconnected: '$(error) Disconnected',
+  disconnected: '$(error) hub 未连接：请运行 tts-hub',
 };
+
+/** T12.2：bind 模式降级到 ServerTransport（绑 39998 直连 TTS）时的状态栏文案。 */
+const HUB_FALLBACK_BIND_STATUS = '$(warning) tts-hub 未连接：已降级为直连 TTS（绑 39998）';
+
+/** T12.2：bind 模式启动时探测 hub 可达性的超时（任务书规定 500ms）。 */
+const HUB_PROBE_TIMEOUT_MS = 500;
+
+/**
+ * T12.2：一次性探测 hub 端口是否可达（bind 模式的启动决策，超时 500ms）。
+ * net.connect 连上即 resolve(true)；'error'（如 hub 未启动的 ECONNREFUSED）
+ * 或超时即 resolve(false)。探测连接随即销毁，不影响后续传输层选型。
+ */
+function probeHubReachable(
+  host: string,
+  port: number,
+  timeoutMs: number = HUB_PROBE_TIMEOUT_MS
+): Promise<boolean> {
+  return new Promise<boolean>(resolve => {
+    const socket = net.connect(port, host);
+    let settled = false;
+    let timer: NodeJS.Timeout | null = null;
+    const finish = (reachable: boolean) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      socket.destroy();
+      resolve(reachable);
+    };
+    timer = setTimeout(() => finish(false), timeoutMs);
+    socket.once('connect', () => finish(true));
+    socket.on('error', () => finish(false));
+  });
+}
 
 /**
  * Forms an array with directory paths where to look for files to be included
@@ -113,8 +152,15 @@ function getLuaSearchPatterns(): string[] {
 export default class TTSAdapter extends vscode.Disposable {
   private static instance: TTSAdapter;
   private _inGameObjects: InGameObjectsList = {};
-  /** 出入站共用传输层（T1.3）：默认连 hub 39997 扇出、出站直发 TTS 39999 */
-  private transport: ITransport;
+  /**
+   * 出入站共用传输层（T1.3）：默认连 hub 39997 扇出、出站直发 TTS 39999；
+   * T12.2 起 bind 降级时也可能是绑 39998 的 ServerTransport。bind 模式的
+   * 启动探测（≤500ms）期间尚未选定，故允许为空——空等价于「未连接」，
+   * sendToTTS 直接跳过。
+   */
+  private transport?: ITransport;
+  /** T12.2：bind 探测期间被 dispose 时置位，防止探测完成后又挂上传输层 */
+  private _disposed = false;
   private _lastSentScripts: {[key: string]: TTSTypes.ScriptState} = {};
   private _retIdCounter = 0;
   /** hub 连接状态的常驻状态栏消息；每次 stateChange 换新前先 dispose 旧的 */
@@ -130,40 +176,82 @@ export default class TTSAdapter extends vscode.Disposable {
   /**
    * Wires message handling to a transport at init time.
    *
-   * 默认（未注入 transport 时）按 `ttslua.hub.*` 配置构造 ClientTransport：
-   * 主动连接 hub 的 39997 扇出端口收 TTS 推送，出站仍直发 TTS 本体 39999；
-   * 同时建一个 ConnectionStateMachine 驱动状态栏展示，指数退避重连在传输层
-   * 内部完成。启动为异步，不阻塞构造。
-   * @param transport - 可选注入的 ITransport（测试 / 其他模式）；缺省时用
-   *   hub 客户端传输
+   * 默认（未注入 transport 时）按 `ttslua.hub.*` 配置选传输层（T12.2）：
+   * - 'prompt'：ClientTransport——主动连接 hub 39997 扇出端口收 TTS 推送，
+   *   出站仍直发 TTS 本体 39999；连不上不回落，由 ConnectionStateMachine
+   *   的指数退避重连，状态栏提示「请运行 tts-hub」；
+   * - 'bind'：先探测 hub 端口（500ms 超时）——可达走 ClientTransport，
+   *   不可达降级为 ServerTransport（临时绑 39998 收 TTS，与 CLI 独立模式
+   *   同策略）。
+   * 启动为异步，不阻塞构造（bind 探测最长 500ms）。
+   * @param transport - 可选注入的 ITransport（测试 / 其他模式）；缺省时按
+   *   `ttslua.hub.fallback` 选型
    */
   constructor(transport?: ITransport) {
     super(() => this.dispose());
     if (transport) {
-      this.transport = transport;
+      // 测试 / 其他模式注入的 transport：原样使用，不做降级选型
+      this.attachTransport(transport);
     } else {
       const hubCfg = getHubConfig();
       const csm = new ConnectionStateMachine(hubCfg.reconnectMaxMs);
-      this.transport = new ClientTransport(hubCfg, csm);
-      // 状态栏镜像 hub 连接生命周期（保留上游 setStatusBarMessage 模式）
-      csm.on('stateChange', state => this.updateHubStatusBar(state));
-      this.updateHubStatusBar(csm.state);
+      void this.selectTransport(hubCfg, csm).catch((err: Error) => {
+        console.error(`[TTSLua] Transport selection failed: ${err.message}`);
+      });
     }
-    // T6：入站触发源由上游「socket 'close' + JSON.parse」改为 transport 回调
-    this.transport.onMessage(msg => this.handleMessage(msg));
-    // 异步启动、不阻塞构造；首连失败（如 hub 未启动）只记日志——建连成功后
-    // 的断线重连由状态机驱动，首连失败的降级（ttslua.hub.fallback）属上层
-    // 策略，此处不擅自重试
-    void this.transport.start().catch((err: Error) => {
-      console.error(`[TTSLua] Hub connect failed: ${err.message}`);
-    });
     TTSAdapter.instance = this;
+  }
+
+  /**
+   * 按 `ttslua.hub.fallback` 与 hub 可达性选择传输层（T12.2）：
+   * - 'prompt'：恒用 ClientTransport，不回落；csm 'disconnected' 时状态栏
+   *   显示「$(error) hub 未连接：请运行 tts-hub」；
+   * - 'bind'：启动时探测 hub 端口（HUB_PROBE_TIMEOUT_MS 超时）——可达走
+   *   ClientTransport（与 prompt 同），不可达回落 ServerTransport（绑 39998）。
+   *   探测连接不参与后续收发。
+   */
+  private async selectTransport(hubCfg: HubConfig, csm: ConnectionStateMachine): Promise<void> {
+    if (hubCfg.fallback === 'bind') {
+      const reachable = await probeHubReachable(hubCfg.host, hubCfg.port);
+      // 探测期间已被 dispose：不再挂传输层（dispose 已把 stop 交给空 transport）
+      if (this._disposed) return;
+      if (!reachable) {
+        // hub 不在线：降级为直连 TTS；ServerTransport.start 若发现 39998 被占
+        // （如 hub 刚好抢占）会按上游语义弹 EADDRINUSE 错误框
+        console.log('[TTSLua] tts-hub unreachable, falling back to ServerTransport (bind 39998)');
+        this._hubStatusBar?.dispose();
+        this._hubStatusBar = vscode.window.setStatusBarMessage(HUB_FALLBACK_BIND_STATUS);
+        this.attachTransport(new ServerTransport());
+        return;
+      }
+    }
+    // prompt 模式，或 bind 模式探测到 hub 可达：走 hub 客户端
+    // 状态栏镜像 hub 连接生命周期（保留上游 setStatusBarMessage 模式）
+    csm.on('stateChange', state => this.updateHubStatusBar(state));
+    this.updateHubStatusBar(csm.state);
+    this.attachTransport(new ClientTransport(hubCfg, csm));
+  }
+
+  /**
+   * 挂载传输层（T1.3 的接线逻辑，T12.2 抽成方法供两条选型路径复用）：
+   * 注册入站回调并异步启动，不阻塞构造；启动失败只记日志——建连成功后的
+   * 断线重连由状态机驱动，bind 模式的降级已在 selectTransport 定夺。
+   */
+  private attachTransport(transport: ITransport): void {
+    this.transport = transport;
+    // T6：入站触发源由上游「socket 'close' + JSON.parse」改为 transport 回调
+    transport.onMessage(msg => this.handleMessage(msg));
+    // 异步启动、不阻塞构造
+    void transport.start().catch((err: Error) => {
+      console.error(`[TTSLua] Transport start failed: ${err.message}`);
+    });
   }
 
   /**
    * 把 hub 连接状态镜像到状态栏（保留上游 setStatusBarMessage 模式）：
    * connected → $(check)、connecting / reconnecting → $(sync~spin)、
-   * disconnected → $(error)。先 dispose 上一条再挂新消息，避免状态堆叠。
+   * disconnected → $(error) hub 未连接：请运行 tts-hub（T12.2 prompt 模式要求）。
+   * 先 dispose 上一条再挂新消息，避免状态堆叠。
    */
   private updateHubStatusBar(state: ConnectionState): void {
     this._hubStatusBar?.dispose();
@@ -659,8 +747,9 @@ export default class TTSAdapter extends vscode.Disposable {
    * @param object - Mutable object according to type
    */
   private async sendToTTS(messageID: TTSTypes.TxMsgType, object?: object) {
-    // T8.3：hub 扇出连接不在位时不发（替代上游的 isServerRunning 检查）
-    if (!this.transport.isConnected()) return;
+    // T8.3：hub 扇出连接不在位时不发（替代上游的 isServerRunning 检查）；
+    // T12.2：bind 模式启动探测期间 transport 尚未选定，同样按「未连接」跳过
+    if (!this.transport?.isConnected()) return;
     const statusBar = vscode.window.setStatusBarMessage('$(sync~spin) Connecting to TTS');
     try {
       await this.transport.send(messageID, object);
@@ -796,7 +885,9 @@ export default class TTSAdapter extends vscode.Disposable {
   }
 
   public dispose() {
-    void this.transport.stop();
+    // T12.2：bind 探测期间 dispose 时 transport 可能尚未选定（见 selectTransport）
+    this._disposed = true;
+    void this.transport?.stop();
     this._hubStatusBar?.dispose();
     console.log('TTSAdapter disposed');
   }
