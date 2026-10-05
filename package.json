@@ -301,6 +301,37 @@
             "default": false
           }
         }
+      },
+      {
+        "order": 50,
+        "id": "ttslua.hub",
+        "title": "Hub Connection",
+        "properties": {
+          "ttslua.hub.host": {
+            "description": "hub 监听地址（默认 127.0.0.1）",
+            "type": "string",
+            "default": "127.0.0.1"
+          },
+          "ttslua.hub.port": {
+            "description": "hub TCP 扇出端口（默认 39997）",
+            "type": "number",
+            "default": 39997
+          },
+          "ttslua.hub.fallback": {
+            "description": "hub 不在线时的降级策略：prompt=提示启动 hub；bind=临时绑 39998 监听 TTS（与 CLI 独立模式同策略）",
+            "type": "string",
+            "enum": [
+              "prompt",
+              "bind"
+            ],
+            "default": "prompt"
+          },
+          "ttslua.hub.reconnectMaxMs": {
+            "description": "重连退避上限（毫秒）",
+            "type": "number",
+            "default": 30000
+          }
+        }
       }
     ],
     "not-walkthroughs": [

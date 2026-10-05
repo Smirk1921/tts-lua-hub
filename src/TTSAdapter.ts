@@ -1,6 +1,23 @@
+/**
+ * TTS Adapter singleton（Stage C / T1.3 传输层解耦）：
+ *
+ * 上游版本在本类内起 `net.Server` 监听 39998 收 TTS 推送，出站则在 sendToTTS
+ * 里现起 `net.connect` 直发 TTS 本体 39999。本版本把字节通道全部抽到
+ * ITransport（src/transport/）之后，本类只保留消息语义：
+ *
+ * - 入站（TTS→编辑器）：transport.onMessage 回调直喂 handleMessage（T6）；
+ *   默认传输为 ClientTransport——主动连 hub 39997 扇出端口，裸 TCP 字节流
+ *   由 JsonStreamDecoder 分帧；
+ * - 出站（编辑器→TTS）：sendToTTS 经 transport.send 直发 39999，前置
+ *   transport.isConnected() 门槛（T8.3，替代上游的 isServerRunning）；
+ * - 连接生命周期由 ConnectionStateMachine 跟踪，状态栏镜像其 'stateChange'；
+ * - Go-to-Error 用的 _lastSentScripts：GetScripts 响应（T5.2）与 SaveAndPlay
+ *   两条路径都登记，并带内容 hash 持久化到 LocalStorageService（T8.2），
+ *   窗口重载后仍可恢复。
+ */
 import * as vscode from 'vscode';
-import * as net from 'net';
 import * as fs from 'fs';
+import * as crypto from 'crypto';
 
 import path = require('path');
 import bundler from 'luabundle';
@@ -12,8 +29,28 @@ import * as TTSTypes from '@/TTSTypes';
 import TTSConsolePanel from '@/TTSConsole';
 import TTSWorkDir from '@/vscode/TTSWorkDir';
 import LocalStorageService from './vscode/LocalStorageService';
+import {getHubConfig} from '@/config';
+import {ClientTransport} from '@/transport/ClientTransport';
+import {ConnectionStateMachine} from '@/transport/ConnectionStateMachine';
+import type {ConnectionState} from '@/transport/ConnectionStateMachine';
+import type {ITransport} from '@/transport/ITransport';
 
 type InGameObjectsList = {[key: string]: {name?: string; type?: string; iname?: string}};
+
+/** T8.2：持久化到 LocalStorageService 的 _lastSentScripts 条目（带内容 hash）。 */
+interface PersistedScriptEntry {
+  scriptState: TTSTypes.ScriptState;
+  /** sha256(script) 前 16 位；恢复时校验，不一致则丢弃该条目 */
+  hash: string;
+}
+
+/** 连接状态 → 状态栏文案（T1.3）。 */
+const HUB_STATUS_TEXT: {[key in ConnectionState]: string} = {
+  connected: '$(check) Connected to hub',
+  connecting: '$(sync~spin) Connecting...',
+  reconnecting: '$(sync~spin) Connecting...',
+  disconnected: '$(error) Disconnected',
+};
 
 /**
  * Forms an array with directory paths where to look for files to be included
@@ -76,10 +113,14 @@ function getLuaSearchPatterns(): string[] {
 export default class TTSAdapter extends vscode.Disposable {
   private static instance: TTSAdapter;
   private _inGameObjects: InGameObjectsList = {};
-  private _serverPort = 39998;
-  private _server: net.Server;
+  /** 出入站共用传输层（T1.3）：默认连 hub 39997 扇出、出站直发 TTS 39999 */
+  private transport: ITransport;
   private _lastSentScripts: {[key: string]: TTSTypes.ScriptState} = {};
   private _retIdCounter = 0;
+  /** hub 连接状态的常驻状态栏消息；每次 stateChange 换新前先 dispose 旧的 */
+  private _hubStatusBar?: vscode.Disposable;
+  /** T8.2：_lastSentScripts 在 LocalStorageService 中的键名 */
+  private static readonly LAST_SENT_SCRIPTS_KEY = 'lastSentScripts';
 
   public static getInstance(): TTSAdapter {
     if (!TTSAdapter.instance) TTSAdapter.instance = new TTSAdapter();
@@ -87,45 +128,46 @@ export default class TTSAdapter extends vscode.Disposable {
   }
 
   /**
-   * Creates a server to listen for messages from the game at init time
+   * Wires message handling to a transport at init time.
+   *
+   * 默认（未注入 transport 时）按 `ttslua.hub.*` 配置构造 ClientTransport：
+   * 主动连接 hub 的 39997 扇出端口收 TTS 推送，出站仍直发 TTS 本体 39999；
+   * 同时建一个 ConnectionStateMachine 驱动状态栏展示，指数退避重连在传输层
+   * 内部完成。启动为异步，不阻塞构造。
+   * @param transport - 可选注入的 ITransport（测试 / 其他模式）；缺省时用
+   *   hub 客户端传输
    */
-  constructor() {
+  constructor(transport?: ITransport) {
     super(() => this.dispose());
-    this._server = net.createServer(socket => {
-      const chunks: Buffer[] = [];
-      socket.on('data', data => chunks.push(data));
-      socket.on('close', () => {
-        this.handleMessage(JSON.parse(chunks.join('').toString()));
-      });
+    if (transport) {
+      this.transport = transport;
+    } else {
+      const hubCfg = getHubConfig();
+      const csm = new ConnectionStateMachine(hubCfg.reconnectMaxMs);
+      this.transport = new ClientTransport(hubCfg, csm);
+      // 状态栏镜像 hub 连接生命周期（保留上游 setStatusBarMessage 模式）
+      csm.on('stateChange', state => this.updateHubStatusBar(state));
+      this.updateHubStatusBar(csm.state);
+    }
+    // T6：入站触发源由上游「socket 'close' + JSON.parse」改为 transport 回调
+    this.transport.onMessage(msg => this.handleMessage(msg));
+    // 异步启动、不阻塞构造；首连失败（如 hub 未启动）只记日志——建连成功后
+    // 的断线重连由状态机驱动，首连失败的降级（ttslua.hub.fallback）属上层
+    // 策略，此处不擅自重试
+    void this.transport.start().catch((err: Error) => {
+      console.error(`[TTSLua] Hub connect failed: ${err.message}`);
     });
-    this.isServerRunning();
     TTSAdapter.instance = this;
   }
 
   /**
-   * Converts asyncronouse listen function to Promise.
-   * @returns Promise of server running state
+   * 把 hub 连接状态镜像到状态栏（保留上游 setStatusBarMessage 模式）：
+   * connected → $(check)、connecting / reconnecting → $(sync~spin)、
+   * disconnected → $(error)。先 dispose 上一条再挂新消息，避免状态堆叠。
    */
-  private isServerRunning(): Promise<boolean> {
-    return new Promise(resolve => {
-      if (!this._server.listening)
-        this._server
-          .listen(this._serverPort, 'localhost')
-          .once('listening', () => resolve(true))
-          .once('error', (err: NodeJS.ErrnoException) => {
-            if (err.code === 'EADDRINUSE')
-              vscode.window.showErrorMessage(
-                'Another instance of TTSLua or Atom is already running',
-                {
-                  modal: true,
-                  detail: 'Please close the other instance and try again.',
-                }
-              );
-            else console.error(`[TTSLua] Server ${err}`);
-            resolve(false);
-          });
-      else resolve(true);
-    });
+  private updateHubStatusBar(state: ConnectionState): void {
+    this._hubStatusBar?.dispose();
+    this._hubStatusBar = vscode.window.setStatusBarMessage(HUB_STATUS_TEXT[state]);
   }
 
   /**
@@ -172,7 +214,11 @@ export default class TTSAdapter extends vscode.Disposable {
     // An indexed array is used to backreference the guids when parsing the UI portion
     const scripts: {[key: string]: TTSTypes.ScriptState} = {};
     for (const [file] of files.filter(([file]) => file.endsWith('.lua'))) {
-      const [name, guid] = file.split('.');
+      // T8.1：对象名里可能含点号，按「最后一个点号到 .lua 之间」解析 guid，
+      // 其前缀整体作为对象名（与 executeLua 的解析一致）
+      const m = /^(.+)\.([^.]+)\.lua$/.exec(file);
+      if (!m) continue;
+      const [, name, guid] = m;
       const fileContents = (await TTSWorkDir.instance.readFile(file)).toString();
       try {
         scripts[guid] = {
@@ -267,6 +313,8 @@ export default class TTSAdapter extends vscode.Disposable {
     }
     // Do the sending
     this._lastSentScripts = scripts;
+    // T8.2：带内容 hash 快照到 LocalStorageService，窗口重载后 Go-to-Error 仍可用
+    this.persistLastSentScripts();
     this.sendToTTS(TTSTypes.TxMsgType.SaveAndPlay, {
       scriptStates: [...Object.values(scripts)],
     });
@@ -419,7 +467,12 @@ export default class TTSAdapter extends vscode.Disposable {
     // Show Button to User
     const option = await vscode.window.showErrorMessage(message.error, 'Go to Error');
     if (!option) return; // Dismissed
-    if (!this._lastSentScripts) {
+    if (Object.keys(this._lastSentScripts).length === 0) {
+      // T8.2：内存里没有快照（如窗口刚重载）——先从 LocalStorageService
+      // 恢复（逐条校验内容 hash），再决定是否报错
+      this.restoreLastSentScripts();
+    }
+    if (Object.keys(this._lastSentScripts).length === 0) {
       vscode.window.showErrorMessage(
         'Unable to locate Error. Make sure you have sent scripts first with Save & Play'
       );
@@ -467,6 +520,53 @@ export default class TTSAdapter extends vscode.Disposable {
   }
 
   /**
+   * T8.2：把 _lastSentScripts 整表快照进 LocalStorageService，每个条目附带
+   * 脚本内容的 sha256 前 16 位；恢复时以此校验，防止过期快照误导 Go-to-Error。
+   * 持久化失败绝不影响主流程（吞掉并记日志）。
+   */
+  private persistLastSentScripts(): void {
+    try {
+      const payload: {[guid: string]: PersistedScriptEntry} = {};
+      for (const guid in this._lastSentScripts) {
+        const scriptState = this._lastSentScripts[guid];
+        payload[guid] = {
+          scriptState,
+          hash: TTSAdapter.hashScript(scriptState.script),
+        };
+      }
+      void LocalStorageService.setValue(TTSAdapter.LAST_SENT_SCRIPTS_KEY, payload);
+    } catch (err) {
+      console.error(`[TTSLua] Unable to persist sent scripts: ${err}`);
+    }
+  }
+
+  /**
+   * T8.2：从 LocalStorageService 恢复 _lastSentScripts（窗口重载后内存为空
+   * 时的兜底）。存储值缺 hash 或 hash 与脚本内容不一致的条目直接丢弃。
+   */
+  private restoreLastSentScripts(): void {
+    try {
+      const payload = LocalStorageService.getValue<{
+        [guid: string]: PersistedScriptEntry;
+      }>(TTSAdapter.LAST_SENT_SCRIPTS_KEY);
+      if (!payload) return;
+      for (const guid in payload) {
+        const entry = payload[guid];
+        if (!entry?.scriptState) continue;
+        if (TTSAdapter.hashScript(entry.scriptState.script) !== entry.hash) continue;
+        this._lastSentScripts[guid] = entry.scriptState;
+      }
+    } catch {
+      // LocalStorageService 未初始化等场景：无快照可恢复，保持现状即可
+    }
+  }
+
+  /** 脚本内容的短 hash（sha256 前 16 位），用于持久化条目的新鲜度校验。 */
+  private static hashScript(script: string): string {
+    return crypto.createHash('sha256').update(script).digest('hex').slice(0, 16);
+  }
+
+  /**
    * Creates files into workspace from received scriptStates
    * @param scriptStates - State of all received scripts
    */
@@ -489,6 +589,9 @@ export default class TTSAdapter extends vscode.Disposable {
       for (const scriptState of scriptStates) {
         // Sanitize script name
         scriptState.name = scriptState.name.replace(/([":<>/\\|?*])/g, '');
+        // T5.2：记录刚收到的脚本（与 saveAndPlay 的
+        // `this._lastSentScripts = scripts` 同语义），Go-to-Error 由此定位
+        this._lastSentScripts[scriptState.guid] = scriptState;
         // XML File Creation
         // If the file received has UI Data or if user explicitly wants to create UI file for each.
         if (scriptState.ui || createXml) {
@@ -504,7 +607,9 @@ export default class TTSAdapter extends vscode.Disposable {
         }
         // Lua File Creation
         // First create the file as-is
-        const luaHandler = new ws.FileHandler(`${scriptState.name}.${scriptState.guid}.lua`.replace(/\n/gi, ''));
+        const luaHandler = new ws.FileHandler(
+          `${scriptState.name}.${scriptState.guid}.lua`.replace(/\n/gi, '')
+        );
         await luaHandler.write(scriptState.script);
         try {
           // Then, attempt to unbundle
@@ -522,6 +627,8 @@ export default class TTSAdapter extends vscode.Disposable {
         if (scriptState.name === 'Global') globalHandlers.push(luaHandler);
         filesRecv.push(luaHandler);
       }
+      // T8.2：本轮接收完成后，把快照（含内容 hash）同步到 LocalStorageService
+      this.persistLastSentScripts();
     }
     // Remove files not marked as received from the workFolder.
     // If a single object was pushed, do not remove files.
@@ -552,24 +659,22 @@ export default class TTSAdapter extends vscode.Disposable {
    * @param object - Mutable object according to type
    */
   private async sendToTTS(messageID: TTSTypes.TxMsgType, object?: object) {
-    if (await !this.isServerRunning()) return;
+    // T8.3：hub 扇出连接不在位时不发（替代上游的 isServerRunning 检查）
+    if (!this.transport.isConnected()) return;
     const statusBar = vscode.window.setStatusBarMessage('$(sync~spin) Connecting to TTS');
-    const client = net.connect(39999, 'localhost', () => {
-      client.write(JSON.stringify({messageID, ...object}));
-      statusBar.dispose();
-      client.destroy();
-    });
-    client.on('error', (err: NodeJS.ErrnoException) => {
-      if (err.code === 'ECONNREFUSED') {
-        statusBar.dispose();
+    try {
+      await this.transport.send(messageID, object);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ECONNREFUSED') {
         vscode.window.showErrorMessage(
           'Unable to connect to Tabletop Simulator.\n\n' +
             'Check that the game is running and a save has been loaded.',
           {modal: true}
         );
       } else console.error(`[TTSLua] Net Client ${err}`);
-    });
-    client.on('end', () => client.destroy());
+    } finally {
+      statusBar.dispose();
+    }
   }
 
   executeLua(script?: string, guid?: string) {
@@ -578,7 +683,10 @@ export default class TTSAdapter extends vscode.Disposable {
     if (!editor) return;
     if (!script && !guid) {
       script = editor.document.getText(editor.selection);
-      guid = path.basename(editor.document.fileName).split('.')[1];
+      // T8.1：对象名里可能含点号，取「最后一个点号与 .lua 之间」的字段为
+      // guid（与 saveAndPlay 的解析一致）；解析失败保持 undefined（原行为）
+      const m = /^(.+)\.([^.]+)\.lua$/.exec(path.basename(editor.document.fileName));
+      if (m) guid = m[2];
     } else if (!script || !guid) {
       console.error('Script or GUID not provided');
       return;
@@ -629,7 +737,7 @@ export default class TTSAdapter extends vscode.Disposable {
         const prefix = pre + indent + before;
         const marker = `<!-- include ${insertPath} -->`;
         const possiblePaths = getSearchPaths([insertPath]);
-        // Try to open each possible path, and insert the first one that works
+        // Try to open each path, and insert the first one that works
         for (const lookupPath of possiblePaths) {
           // Check if the file exists before attempting to open it
           try {
@@ -688,7 +796,8 @@ export default class TTSAdapter extends vscode.Disposable {
   }
 
   public dispose() {
-    if (this._server) this._server.close();
-    console.log('Server disposed');
+    void this.transport.stop();
+    this._hubStatusBar?.dispose();
+    console.log('TTSAdapter disposed');
   }
 }
