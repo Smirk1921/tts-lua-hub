@@ -2,6 +2,61 @@
 
 All notable changes to the "tabletopsimulator-lua" extension will be documented in this file.
 
+## [2.0.0-hub.1] — 2026-10-06 (fork: hub integration)
+
+> Fork of [rolandostar/tabletopsimulator-lua-vscode](https://github.com/rolandostar/tabletopsimulator-lua-vscode) @ commit `581f0c2` (last upstream activity 2023-04-07).
+
+### Added — Hub integration
+
+- New `src/transport/` layer:
+  - `ITransport` interface (`start/stop/onMessage/send/isConnected`).
+  - `JsonStreamDecoder` — brace counter with string/escape state machine (24 unit tests).
+  - `ClientTransport` — connects to `tts-hub` daemon on TCP 39997 to receive fan-out;
+    outbound commands still go directly to TTS on 39999.
+  - `ConnectionStateMachine` — 4-state (disconnected/connecting/connected/reconnecting)
+    with exponential backoff 100ms → 30s (20 unit tests).
+  - `ServerTransport` — exact upstream behavior preserved (EADDRINUSE dialog).
+- `TTSAdapter` refactored to depend on `ITransport`; no longer binds 39998 when
+  the hub is reachable.
+- Dual-mode fallback via `ttslua.hub.fallback`:
+  - `"prompt"` (default) — only try the hub; show a status-bar hint when offline.
+  - `"bind"` — probe 39998 for 500ms; fall back to upstream `ServerTransport`
+    if hub is unreachable.
+- New configuration section `ttslua.hub.{host, port, fallback, reconnectMaxMs}`.
+- `_lastSentScripts` persisted via `LocalStorageService` (globalState) with sha256
+  checksum for corruption detection.
+- Filenames with dots in object names now resolve correctly
+  (`/^(.+)\.([^.]+)\.lua$/` — last segment is the guid).
+- `transport.isConnected()` guard on outbound paths.
+- `api.json` upgraded **13.2.1.1 → 14.0.3.2** (Berserk Games official source,
+  byte-level round-trip verified). Original 13.2.1.1 kept as `media/api.json.v13.bak`
+  (not shipped in the VSIX).
+
+### Changed
+
+- `package.json` identity fields updated for the fork:
+  - `name`: `tabletopsimulator-lua` → `tts-lua-hub`
+  - `displayName`: → `Tabletop Simulator Lua (Hub Edition)`
+  - `version`: `2.0.0-rc1` → `2.0.0-hub.1`
+  - `publisher`: `rolandostar` → `Smirk1921`
+  - `repository` / `bugs` / `homepage` / `sponsor` → point at this fork
+  - Removed `__metadata` (upstream Marketplace publisherId residue).
+- README: added fork declaration at the top (English) and kept the original
+  Chinese "Hub 集成" section; upstream README content preserved below for
+  attribution.
+- LICENSE: appended fork copyright line above the four upstream MIT notices
+  (Rolando Romero 2019 / onelivesleft 2017 / OliPro007 2018 / Berserk Games 2015).
+- Added `NOTICE.md` explaining the fork relationship and third-party licenses.
+- Removed `.github/workflows/deploy-to-marketplace.yaml` (pointed to upstream
+  `secrets.VS_MARKETPLACE_TOKEN`, unusable for this fork); kept `build-docs.yaml`.
+
+### Tests
+
+- 56 unit tests passing (JsonStreamDecoder 24 + ClientTransport 14 +
+  ConnectionStateMachine 20, minus 2 overlaps).
+- `tsc` clean; `webpack --mode development` and `--mode production` clean.
+- 9 end-to-end verification scripts against a real `tts-hub` + TTS instance pass.
+
 ## [2.0.0] 🎉
 
 - Execute Lua without Save & Play

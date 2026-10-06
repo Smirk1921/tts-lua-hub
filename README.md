@@ -1,3 +1,49 @@
+# Tabletop Simulator Lua (Hub Edition)
+
+> **This is a fork of [rolandostar/tabletopsimulator-lua-vscode](https://github.com/rolandostar/tabletopsimulator-lua-vscode)**
+> (last upstream commit 2023-04, inactive for 3.5 years) with the following additions:
+>
+> - **Hub integration** — connect to a `tts-hub` daemon on port **39997** (TCP fan-out)
+>   instead of binding 39998 directly, sharing a single TTS connection with the
+>   [tts-toolkit](https://github.com/Smirk1921/tts-toolkit) CLI and any MCP-compatible
+>   AI agent. No more "close the official extension first" conflicts.
+> - **Dual-mode fallback** — when the hub is offline, either prompt the user to start
+>   `tts-hub` (default, `ttslua.hub.fallback: "prompt"`) or temporarily bind 39998
+>   like the upstream (`ttslua.hub.fallback: "bind"`).
+> - **Updated api.json** — TTS Lua API definitions bumped from 13.2.1.1 to **14.0.3.2**.
+> - **Robust script tracking** — `_lastSentScripts` persisted with sha256 checksum;
+>   filenames with dots in object names now resolve correctly.
+>
+> Original plugin by **Rolando Romero**, **onelivesleft**, **OliPro007**, **Berserk Games** (MIT).
+> Fork maintained by [Smirk1921](https://github.com/Smirk1921).
+>
+> Install from [GitHub Releases](https://github.com/Smirk1921/tts-lua-hub/releases)
+> (`code --install-extension tts-lua-hub-<version>.vsix`) or — once published — from the
+> [VSCode Marketplace](https://marketplace.visualstudio.com/items?itemName=Smirk1921.tts-lua-hub).
+
+---
+
+## Hub 集成（本 fork 的改动）
+
+本仓库是 [`rolandostar/tabletopsimulator-lua-vscode`](https://github.com/rolandostar/tabletopsimulator-lua-vscode) 的 fork，为 **TTS 图包制作维护工具**适配了它的 `tts-hub` 常驻进程：
+
+- 默认经 hub 的 **39997 TCP 扇出**接收 TTS 推送；出站命令仍直发 TTS 本体 39999。
+- hub 不在线时按 `ttslua.hub.fallback` 降级：
+  - `prompt`（默认）：只连 hub，连不上时状态栏提示「请运行 tts-hub」；
+  - `bind`：临时绑 39998 监听 TTS（与 CLI 独立模式同策略）。
+- 连接配置（`ttslua.hub.host` / `port` / `fallback` / `reconnectMaxMs`）与完整说明见 [`../docs/editor.md`](../docs/editor.md) 的「VSCode 插件（深度层）」章节。
+- 原版功能保留：Console++ 集成 / Lua 与 XML 自动补全 / 错误跳转（Go to Error）/ Execute Lua / Get-Send Scripts。
+
+---
+
+## Upstream README
+
+The content below is preserved verbatim from the original
+[rolandostar/tabletopsimulator-lua-vscode](https://github.com/rolandostar/tabletopsimulator-lua-vscode)
+README for reference. Some links, badges and the sponsor section point to the
+upstream author's accounts and are kept here for attribution; they do **not**
+represent this fork.
+
 <div align="center">
 <h2>Tabletop Simulator Lua Extension for VSCode</h2>
 <br>
@@ -11,26 +57,10 @@ Extension for VSCode to make writing Lua scripts for  <a href="https://store.ste
 </p>
 
 <div align="center">
-
-[![Build Documentation](https://github.com/rolandostar/tabletopsimulator-lua-vscode/actions/workflows/build-docs.yaml/badge.svg?branch=main)](https://github.com/rolandostar/tabletopsimulator-lua-vscode/actions/workflows/build-docs.yaml)
-[![Deploy Extension](https://github.com/rolandostar/tabletopsimulator-lua-vscode/actions/workflows/deploy-to-marketplace.yaml/badge.svg?branch=main)](https://github.com/rolandostar/tabletopsimulator-lua-vscode/actions/workflows/deploy-to-marketplace.yaml)
-</div>
-<div align="center">
 <img src="https://badgen.net/badge/uses/TS/blue"/>
 <img src="https://badgen.net/badge/designed in/MS Paint/yellow"/>
 <img src="https://badgen.net/badge/made%20with/%E2%9D%A4/red"/>
 </div>
-
-## Hub 集成（本 fork 的改动）
-
-本仓库是 [`rolandostar/tabletopsimulator-lua-vscode`](https://github.com/rolandostar/tabletopsimulator-lua-vscode) 的 fork，为 **TTS 图包制作维护工具**适配了它的 `tts-hub` 常驻进程：
-
-- 默认经 hub 的 **39997 TCP 扇出**接收 TTS 推送；出站命令仍直发 TTS 本体 39999。
-- hub 不在线时按 `ttslua.hub.fallback` 降级：
-  - `prompt`（默认）：只连 hub，连不上时状态栏提示「请运行 tts-hub」；
-  - `bind`：临时绑 39998 监听 TTS（与 CLI 独立模式同策略）。
-- 连接配置（`ttslua.hub.host` / `port` / `fallback` / `reconnectMaxMs`）与完整说明见 [`../docs/editor.md`](../docs/editor.md) 的「VSCode 插件（深度层）」章节。
-- 原版功能保留：Console++ 集成 / Lua 与 XML 自动补全 / 错误跳转（Go to Error）/ Execute Lua / Get-Send Scripts。
 
 ## Features
 

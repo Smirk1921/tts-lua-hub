@@ -1,10 +1,10 @@
 {
-  "name": "tabletopsimulator-lua",
-  "displayName": "Tabletop Simulator Lua",
-  "author": "Rolando Romero <contact@rolandostar.com> (https://rolandostar.com/)",
-  "description": "Extension for VSCode to make writing Lua scripts for Tabletop Simulator easier.",
-  "version": "2.0.0-rc1",
-  "publisher": "rolandostar",
+  "name": "tts-lua-hub",
+  "displayName": "Tabletop Simulator Lua (Hub Edition)",
+  "author": "Rolando Romero <contact@rolandostar.com> (https://rolandostar.com/); fork maintained by Smirk1921",
+  "description": "Extension for VSCode to make writing Lua scripts for Tabletop Simulator easier. Fork with hub integration: share a single TTS connection with tts-toolkit CLI, dual-mode fallback, api.json 14.0.3.2.",
+  "version": "2.0.0-hub.1",
+  "publisher": "Smirk1921",
   "license": "MIT",
   "engines": {
     "node": ">=12.9.0",
@@ -12,8 +12,12 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/rolandostar/tabletopsimulator-lua-vscode"
+    "url": "https://github.com/Smirk1921/tts-lua-hub"
   },
+  "bugs": {
+    "url": "https://github.com/Smirk1921/tts-lua-hub/issues"
+  },
+  "homepage": "https://github.com/Smirk1921/tts-lua-hub#readme",
   "categories": [
     "Programming Languages",
     "Other"
@@ -451,38 +455,23 @@
     "theme": "dark"
   },
   "sponsor": {
-    "url": "https://github.com/sponsors/rolandostar"
+    "url": "https://github.com/sponsors/Smirk1921"
   },
   "badges": [
     {
-      "url": "https://github.com/rolandostar/tabletopsimulator-lua-vscode/actions/workflows/build-docs.yaml/badge.svg?branch=main",
-      "href": "https://github.com/rolandostar/tabletopsimulator-lua-vscode/actions/workflows/build-docs.yaml",
-      "description": ""
-    },
-    {
-      "url": "https://github.com/rolandostar/tabletopsimulator-lua-vscode/actions/workflows/deploy-to-marketplace.yaml/badge.svg?branch=main",
-      "href": "https://github.com/rolandostar/tabletopsimulator-lua-vscode/actions/workflows/deploy-to-marketplace.yaml",
-      "description": ""
-    },
-    {
       "url": "https://badgen.net/badge/uses/TS/blue",
-      "href": "https://github.com/rolandostar/tabletopsimulator-lua-vscode",
+      "href": "https://github.com/Smirk1921/tts-lua-hub",
       "description": ""
     },
     {
-      "url": "https://badgen.net/badge/designed in/MS Paint/grey",
+      "url": "https://badgen.net/badge/fork%20of/rolandostar%2Ftabletopsimulator--lua/grey",
       "href": "https://github.com/rolandostar/tabletopsimulator-lua-vscode",
-      "description": ""
+      "description": "Upstream (inactive since 2023-04)"
     },
     {
       "url": "https://badgen.net/badge/made%20with/%E2%9D%A4/red",
-      "href": "https://github.com/rolandostar/tabletopsimulator-lua-vscode",
+      "href": "https://github.com/Smirk1921/tts-lua-hub",
       "description": "<3"
     }
-  ],
-  "__metadata": {
-    "id": "0d2c6449-7895-4837-aad4-bb90deb5b47a",
-    "publisherDisplayName": "rolandostar",
-    "publisherId": "409bdebf-bb4b-4a76-a60a-8fa2dc343024"
-  }
+  ]
 }
