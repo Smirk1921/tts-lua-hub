@@ -22,6 +22,143 @@
 > [VSCode Marketplace](https://marketplace.visualstudio.com/items?itemName=Smirk1921.tts-lua-hub).
 
 ---
+## Why this fork exists
+
+The official extension (`rolandostar.tabletopsimulator-lua`) binds TTS's
+external-editor port **39998** directly. So does the [tts-toolkit](https://github.com/Smirk1921/tts-toolkit)
+CLI when it needs a live connection (`tts pack pull/diff`, `tts test`, `tts push`,
+`tts assets`, …). That meant you could only use one of them at a time — close
+VSCode to run the CLI, close the CLI to use VSCode.
+
+This fork adds a third mode: connect to a long-running **`tts-hub` daemon**
+(from the tts-toolkit repo) on TCP **39997**. The hub is the only process that
+owns 39998; the CLI, this extension, and any MCP-compatible AI agent all attach
+to the hub as peers. Result: **you can use the CLI and VSCode at the same time,
+against the same loaded save, without conflicts.**
+
+## Architecture
+
+```
+                 ┌──────────────────────────────┐
+                 │  Tabletop Simulator (game)   │
+                 │   listens on 39998 / 39999   │
+                 └──────────────┬───────────────┘
+                                │ (single connection)
+                       ┌────────┴────────┐
+                       │    tts-hub      │     <- long-running daemon
+                       │  (port 39997)   │        (from tts-toolkit repo)
+                       └────────┬────────┘
+              ┌─────────────────┼─────────────────┐
+              │                 │                 │
+        ┌─────┴─────┐    ┌──────┴──────┐   ┌──────┴──────┐
+        │  tts CLI  │    │ this ext    │   │  MCP agent  │
+        │ (pack /   │    │ (you are    │   │ (ZCode /    │
+        │  test /…) │    │  here)      │   │  Claude…)   │
+        └───────────┘    └─────────────┘   └─────────────┘
+```
+
+If `tts-hub` is not running, this extension can fall back to upstream behavior
+(bind 39998 directly) — see `ttslua.hub.fallback` below.
+
+## What you need the tts-toolkit CLI for
+
+This extension **does not** require the CLI to function in standalone mode —
+everything the upstream extension does, this fork also does (Get/Send Scripts,
+Execute Lua, Console++, autocompletion, Go to Error, …).
+
+You **do** want the CLI (and `tts-hub`) if you care about any of these:
+
+| Capability | Where it lives | Why it matters |
+|---|---|---|
+| Run the hub daemon | `tts-hub` (CLI repo) | enables the coexistence this fork is built for |
+| Pack workspace (`unpack / build / push / diff`) | `tts pack …` | edit decks/objects/scripts/UI as plain files, rebuild byte-identical saves |
+| Lua test runner inside TTS | `tts test` | run `tests/**/*_test.lua` against a live game, get a structured `RunReport` |
+| Deck atlas slicing/stitching | `tts deck …` | turn card sheets into TTS atlases (and back) with remainder absorption |
+| Git-based version control for packs | `tts vcs …` | semantic diff, LFS for binary assets, upstream sync, review gates |
+| Asset import + image hosts | `tts import / host` | bring external images/models into a pack, push to steamcloud / S3 / command hosts |
+| Steam Workshop publishing | `tts build / publish` | BSON payload + kpsteam-powered upload + 7-step manual guide |
+| MCP server for AI agents | `tts-mcp` | expose 12+ tools (status/exec/pull/diff/push/test/build/…) to any MCP client |
+
+The CLI is the same project that produced this fork — they are designed to work
+together. See [tts-toolkit](https://github.com/Smirk1921/tts-toolkit) for full
+CLI documentation.
+
+## Installation
+
+### Option A — VSIX from GitHub Releases (recommended for now)
+
+1. Download `tts-lua-hub-<version>.vsix` from
+   [Releases](https://github.com/Smirk1921/tts-lua-hub/releases).
+2. In VSCode: `Ctrl+Shift+P` → `Extensions: Install from VSIX...` → pick the file.
+   Or from a terminal:
+   ```bash
+   code --install-extension tts-lua-hub-<version>.vsix
+   ```
+3. **Uninstall or disable the official "Tabletop Simulator Lua" extension**
+   (`rolandostar.tabletopsimulator-lua`). Only one of them can be active —
+   they register the same commands and would otherwise conflict.
+
+### Option B — VSCode Marketplace (coming soon)
+
+Will be published as `Smirk1921.tts-lua-hub` once Marketplace registration
+completes. Track [issue #1](https://github.com/Smirk1921/tts-lua-hub/issues)
+for status.
+
+## Configuration
+
+In VSCode `settings.json` (user or workspace):
+
+```jsonc
+{
+  "ttslua.hub.host": "127.0.0.1",
+  "ttslua.hub.port": 39997,
+  "ttslua.hub.fallback": "prompt",       // or "bind"
+  "ttslua.hub.reconnectMaxMs": 30000
+}
+```
+
+| Setting | Values | Effect |
+|---|---|---|
+| `ttslua.hub.host` / `ttslua.hub.port` | default `127.0.0.1:39997` | where the `tts-hub` daemon listens |
+| `ttslua.hub.fallback` | `"prompt"` (default) | only connect via hub; show a status-bar hint when the hub is offline |
+|  | `"bind"` | probe 39998 for 500 ms; if the hub is unreachable, bind 39998 directly like the upstream extension |
+| `ttslua.hub.reconnectMaxMs` | default `30000` | max backoff between reconnect attempts (100 ms → this cap, exponential) |
+
+All other upstream settings (`ttslua.*`) are unchanged.
+
+## End-to-end quick start (this extension + tts-toolkit CLI)
+
+```bash
+# 1. Terminal: clone and build the CLI
+git clone https://github.com/Smirk1921/tts-toolkit.git
+cd tts-toolkit && npm install && npm run build
+
+# 2. Start Tabletop Simulator and load a save
+#    (TTS only listens on 39998/39999 while a save is loaded)
+
+# 3. Start the hub daemon (keep this terminal open)
+node dist/cli/hub-main.js
+#    or, after `npm install -g tts-toolkit`:  tts-hub
+
+# 4. VSCode: install this fork per Option A above, set
+#        "ttslua.hub.fallback": "prompt"
+#    then Ctrl+Shift+P → Developer: Reload Window
+
+# 5. Verify coexistence — the extension's status bar shows
+#    "Connected to tts-hub". In another terminal you can now run:
+node dist/cli/index.js status          # CLI works
+node dist/cli/index.js pull --root .   # CLI pulls scripts; extension stays connected
+#    …and from VSCode "TTS: Get Scripts" / "TTS: Execute Lua" also work
+#    at the same time.
+```
+
+## When you don't want the hub
+
+Set `"ttslua.hub.fallback": "bind"` and don't run `tts-hub`. The extension will
+behave exactly like the upstream (bind 39998 when it needs a connection). You
+just go back to the old rule: close the CLI before using VSCode, and vice versa.
+
+---
 
 ## Hub 集成（本 fork 的改动）
 
