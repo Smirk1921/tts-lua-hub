@@ -7,7 +7,7 @@
   "publisher": "Smirk1921",
   "license": "MIT",
   "engines": {
-    "node": ">=12.9.0",
+    "node": ">=22.19.0",
     "vscode": "^1.72.0"
   },
   "repository": {
